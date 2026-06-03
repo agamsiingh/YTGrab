@@ -20,8 +20,37 @@ const ytdlp = ytdlpPath
   ? youtubedl.create(ytdlpPath)
   : youtubedl;
 
+// Check if cookies file exists
+const cookiesPath = path.join(__dirname, 'cookies.txt');
+const hasCookies = fs.existsSync(cookiesPath);
+
 console.log(`🔧 yt-dlp binary: ${ytdlpPath || 'bundled default'}`);
 console.log(`🔧 ffmpeg binary: ${ffmpeg}`);
+console.log(`🍪 cookies.txt: ${hasCookies ? 'FOUND' : 'not found (YouTube may block datacenter IPs)'}`);
+
+// Common yt-dlp options to bypass YouTube bot detection on cloud servers
+const BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+function getBaseOptions() {
+  const opts = {
+    noCheckCertificates: true,
+    noWarnings: true,
+    geoBypass: true,
+    userAgent: BROWSER_USER_AGENT,
+    referer: 'https://www.youtube.com/',
+    extractorArgs: 'youtube:player_client=web',
+    addHeader: [
+      'Accept-Language:en-US,en;q=0.9',
+    ],
+  };
+
+  // Use cookies if available — this is the #1 fix for cloud hosting
+  if (hasCookies) {
+    opts.cookies = cookiesPath;
+  }
+
+  return opts;
+}
 
 app.use(cors());
 app.use(express.json());
@@ -53,6 +82,7 @@ app.get('/api/health', (req, res) => {
     ytdlp_path: ytdlpPath || 'bundled',
     ytdlp_local_exists: localBinExists,
     ffmpeg_path: ffmpeg,
+    cookies_found: hasCookies,
     node_version: process.version,
     platform: process.platform,
     arch: process.arch,
@@ -73,9 +103,8 @@ app.get('/api/info', async (req, res) => {
 
   try {
     const info = await ytdlp(url, {
+      ...getBaseOptions(),
       dumpSingleJson: true,
-      noCheckCertificates: true,
-      noWarnings: true,
       preferFreeFormats: true,
     });
 
@@ -147,9 +176,20 @@ app.get('/api/info', async (req, res) => {
   } catch (error) {
     console.error('Error fetching video info:', error.message);
     console.error('Full error:', error.stderr || error);
-    res.status(500).json({
-      error: 'Failed to fetch video information. Please check the URL and try again.',
-    });
+
+    // Provide specific error messages based on the error
+    let userMessage = 'Failed to fetch video information. Please check the URL and try again.';
+    const errText = (error.stderr || error.message || '').toLowerCase();
+
+    if (errText.includes('sign in') || errText.includes('bot') || errText.includes('403')) {
+      userMessage = 'YouTube is blocking requests from this server. The site owner needs to add a cookies.txt file.';
+    } else if (errText.includes('not found') || errText.includes('unavailable')) {
+      userMessage = 'This video is unavailable or does not exist.';
+    } else if (errText.includes('private')) {
+      userMessage = 'This video is private and cannot be downloaded.';
+    }
+
+    res.status(500).json({ error: userMessage });
   }
 });
 
@@ -174,8 +214,7 @@ app.get('/api/download/start', async (req, res) => {
   res.json({ jobId });
 
   const options = {
-    noCheckCertificates: true,
-    noWarnings: true,
+    ...getBaseOptions(),
     ffmpegLocation: ffmpeg,
     output: tempOutputPath,
     concurrentFragments: 8,

@@ -9,7 +9,10 @@ echo "📥 Installing yt-dlp binary..."
 curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ./yt-dlp
 chmod +x ./yt-dlp
 
-echo "✅ yt-dlp installed at ./yt-dlp"
+echo "✅ yt-dlp version:"
 ./yt-dlp --version
+
+# Ensure temp directory exists
+mkdir -p temp
 
 echo "✅ Build complete!"
