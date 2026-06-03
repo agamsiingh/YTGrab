@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "build": "chmod +x build.sh && ./build.sh"
+    "build": "npm install && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ./yt-dlp && chmod +x ./yt-dlp && mkdir -p temp"
   },
   "engines": {
     "node": ">=18.0.0"
