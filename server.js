@@ -2,141 +2,281 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const youtubedl = require('youtube-dl-exec');
+const https = require('https');
+const http = require('http');
 const { v4: uuidv4 } = require('uuid');
-const ffmpeg = require('ffmpeg-static');
+const ffmpegPath = require('ffmpeg-static');
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Determine the yt-dlp binary path
-// On Render (Linux), we install it via build.sh to ./yt-dlp
-// Locally, youtube-dl-exec bundles its own binary
-const localYtdlp = path.join(__dirname, 'yt-dlp');
-const ytdlpPath = fs.existsSync(localYtdlp) ? localYtdlp : undefined;
+// ═══════════════════════════════════════════════════════
+// PIPED API — YouTube proxy that bypasses IP blocking
+// ═══════════════════════════════════════════════════════
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.r4fo.com',
+  'https://pipedapi.in.projectsegfau.lt',
+  'https://piped-api.privacy.com.de',
+  'https://pipedapi.adminforge.de',
+];
 
-// Create a configured yt-dlp instance
-const ytdlp = ytdlpPath
-  ? youtubedl.create(ytdlpPath)
-  : youtubedl;
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-// Check if cookies file exists
-const cookiesPath = path.join(__dirname, 'cookies.txt');
-const hasCookies = fs.existsSync(cookiesPath);
+// ═══════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════
 
-console.log(`🔧 yt-dlp binary: ${ytdlpPath || 'bundled default'}`);
-console.log(`🔧 ffmpeg binary: ${ffmpeg}`);
-console.log(`🍪 cookies.txt: ${hasCookies ? 'FOUND' : 'not found (YouTube may block datacenter IPs)'}`);
+function extractVideoId(url) {
+  const match = url.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  return match ? match[1] : null;
+}
 
-// Common yt-dlp options to bypass YouTube bot detection on cloud servers
-const BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+function isValidYouTubeUrl(url) {
+  return extractVideoId(url) !== null;
+}
 
-function getBaseOptions() {
-  const opts = {
-    noCheckCertificates: true,
-    noWarnings: true,
-    geoBypass: true,
-    userAgent: BROWSER_USER_AGENT,
-    referer: 'https://www.youtube.com/',
-    extractorArgs: 'youtube:player_client=web',
-    addHeader: [
-      'Accept-Language:en-US,en;q=0.9',
-    ],
-  };
+function formatDuration(seconds) {
+  if (!seconds) return '0:00';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
 
-  // Use cookies if available — this is the #1 fix for cloud hosting
-  if (hasCookies) {
-    opts.cookies = cookiesPath;
+function getExtFromMime(mimeType) {
+  if (!mimeType) return 'mp4';
+  if (mimeType.includes('mp4')) return 'mp4';
+  if (mimeType.includes('webm')) return 'webm';
+  if (mimeType.includes('m4a')) return 'm4a';
+  return 'mp4';
+}
+
+// Fetch JSON from URL (with redirect support)
+function fetchJSON(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https') ? https : http;
+    const req = client.get(url, {
+      headers: { 'User-Agent': USER_AGENT },
+      timeout: 20000,
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        fetchJSON(res.headers.location).then(resolve).catch(reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error('Invalid JSON')); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+  });
+}
+
+// Download a file from URL to disk (streaming, low memory)
+function downloadFile(fileUrl, destPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath);
+
+    function doRequest(url) {
+      const client = url.startsWith('https') ? https : http;
+      const req = client.get(url, {
+        headers: { 'User-Agent': USER_AGENT },
+        timeout: 600000, // 10 min timeout for large files
+      }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          doRequest(res.headers.location);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          file.close();
+          fs.unlink(destPath, () => {});
+          reject(new Error(`Download HTTP ${res.statusCode}`));
+          return;
+        }
+        res.pipe(file);
+        file.on('finish', () => file.close(resolve));
+      });
+      req.on('error', (err) => { file.close(); fs.unlink(destPath, () => {}); reject(err); });
+      req.on('timeout', () => { req.destroy(); reject(new Error('Download timeout')); });
+    }
+
+    doRequest(fileUrl);
+  });
+}
+
+// Merge video + audio with ffmpeg
+function mergeMedia(videoPath, audioPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const audioExt = path.extname(audioPath).toLowerCase();
+    const audioCodec = ['.m4a', '.mp4', '.aac'].includes(audioExt) ? 'copy' : 'aac';
+
+    const args = [
+      '-i', videoPath,
+      '-i', audioPath,
+      '-c:v', 'copy',
+      '-c:a', audioCodec,
+      '-movflags', '+faststart',
+      '-y',
+      outputPath,
+    ];
+
+    console.log(`🔧 ffmpeg: merging video + audio (audio codec: ${audioCodec})`);
+    const proc = spawn(ffmpegPath, args);
+
+    let stderr = '';
+    proc.stderr.on('data', (d) => stderr += d.toString());
+
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else {
+        console.error('ffmpeg error (last 300 chars):', stderr.slice(-300));
+        reject(new Error(`ffmpeg exited with code ${code}`));
+      }
+    });
+    proc.on('error', reject);
+  });
+}
+
+// Convert audio to mp3
+function convertToMp3(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, [
+      '-i', inputPath, '-vn', '-acodec', 'libmp3lame', '-ab', '192k', '-y', outputPath,
+    ]);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`mp3 conversion failed (code ${code})`));
+    });
+    proc.on('error', reject);
+  });
+}
+
+// Fetch video info from Piped API (tries multiple instances)
+async function fetchFromPiped(videoId) {
+  let lastError;
+
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      console.log(`📡 Trying: ${instance}/streams/${videoId}`);
+      const data = await fetchJSON(`${instance}/streams/${videoId}`);
+      if (data.error) throw new Error(data.error);
+      console.log(`✅ Success from ${instance}`);
+      return data;
+    } catch (err) {
+      console.error(`❌ ${instance}: ${err.message}`);
+      lastError = err;
+    }
   }
 
-  return opts;
+  throw lastError || new Error('All Piped API instances are unavailable');
 }
+
+// Pick best video stream for a target resolution
+function getBestVideoStream(streams, targetHeight) {
+  if (!streams || streams.length === 0) return null;
+
+  // Only video-only adaptive streams
+  const filtered = streams.filter(s => s.videoOnly !== false);
+  if (filtered.length === 0) return streams[0];
+
+  if (targetHeight > 0) {
+    // Exact match first
+    const exact = filtered.find(s => s.height === targetHeight);
+    if (exact) return exact;
+
+    // Closest match ≤ target
+    const sorted = [...filtered].sort((a, b) => (b.height || 0) - (a.height || 0));
+    const closest = sorted.find(s => (s.height || 0) <= targetHeight);
+    if (closest) return closest;
+  }
+
+  // Default: highest quality
+  return [...filtered].sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+}
+
+// Pick best audio stream (highest bitrate)
+function getBestAudioStream(streams) {
+  if (!streams || streams.length === 0) return null;
+  return [...streams].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+}
+
+// ═══════════════════════════════════════════════════════
+// EXPRESS SETUP
+// ═══════════════════════════════════════════════════════
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Ensure temp directory exists
 const tempDir = path.join(__dirname, 'temp');
 if (!fs.existsSync(tempDir)) {
   fs.mkdirSync(tempDir);
 }
 
-// Validate YouTube URL
-function isValidYouTubeUrl(url) {
-  const patterns = [
-    /^(https?:\/\/)?(www\.)?youtube\.com\/watch\?v=[\w-]{11}/,
-    /^(https?:\/\/)?(www\.)?youtube\.com\/shorts\/[\w-]{11}/,
-    /^(https?:\/\/)?youtu\.be\/[\w-]{11}/,
-    /^(https?:\/\/)?(www\.)?youtube\.com\/embed\/[\w-]{11}/,
-    /^(https?:\/\/)?(m\.)?youtube\.com\/watch\?v=[\w-]{11}/,
-  ];
-  return patterns.some(pattern => pattern.test(url));
-}
+console.log(`🔧 ffmpeg: ${ffmpegPath}`);
 
-// Health check / debug endpoint
+// ═══════════════════════════════════════════════════════
+// API ENDPOINTS
+// ═══════════════════════════════════════════════════════
+
+// Health check
 app.get('/api/health', (req, res) => {
-  const localBinExists = fs.existsSync(localYtdlp);
   res.json({
     status: 'ok',
-    ytdlp_path: ytdlpPath || 'bundled',
-    ytdlp_local_exists: localBinExists,
-    ffmpeg_path: ffmpeg,
-    cookies_found: hasCookies,
-    node_version: process.version,
+    method: 'piped-api',
+    ffmpeg: ffmpegPath,
+    instances: PIPED_INSTANCES,
+    node: process.version,
     platform: process.platform,
-    arch: process.arch,
   });
 });
 
 // Get video info
 app.get('/api/info', async (req, res) => {
   const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'URL is required' });
 
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required' });
-  }
-
-  if (!isValidYouTubeUrl(url)) {
-    return res.status(400).json({ error: 'Invalid YouTube URL. Please provide a valid YouTube video link.' });
-  }
+  const videoId = extractVideoId(url);
+  if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL. Please provide a valid YouTube video link.' });
 
   try {
-    const info = await ytdlp(url, {
-      ...getBaseOptions(),
-      dumpSingleJson: true,
-      preferFreeFormats: true,
-    });
+    const data = await fetchFromPiped(videoId);
 
     const formats = [];
     const seen = new Set();
 
-    if (info.formats) {
-      for (const f of info.formats) {
-        // We include ALL video streams because yt-dlp + ffmpeg will merge them with the best audio
-        if (f.vcodec && f.vcodec !== 'none' && f.height) {
-          const key = `${f.height}p`;
-          // Keep the first (usually highest quality) format for each resolution
-          if (!seen.has(key)) {
-            seen.add(key);
-            formats.push({
-              format_id: f.format_id,
-              ext: f.ext,
-              quality: `${f.height}p`,
-              height: f.height,
-              filesize: f.filesize || f.filesize_approx || null,
-              type: 'video',
-              note: f.vcodec,
-            });
-          }
+    // Process video streams
+    if (data.videoStreams) {
+      for (const s of data.videoStreams) {
+        if (s.quality && s.height && !seen.has(s.quality)) {
+          seen.add(s.quality);
+          formats.push({
+            format_id: String(s.height),
+            ext: s.format === 'MPEG_4' ? 'mp4' : 'webm',
+            quality: s.quality,
+            height: s.height,
+            filesize: s.contentLength ? parseInt(s.contentLength) : null,
+            type: 'video',
+            note: s.codec || s.format || '',
+          });
         }
       }
     }
 
-    // Sort by quality (highest first)
+    // Sort highest first
     formats.sort((a, b) => (b.height || 0) - (a.height || 0));
 
-    // If no formats found for some reason, provide a generic fallback
+    // Fallback
     if (formats.length === 0) {
       formats.push({
         format_id: 'best',
@@ -149,7 +289,7 @@ app.get('/api/info', async (req, res) => {
       });
     }
 
-    // Add audio-only option
+    // Audio option
     formats.push({
       format_id: 'bestaudio',
       ext: 'mp3',
@@ -160,129 +300,121 @@ app.get('/api/info', async (req, res) => {
       note: 'Best audio quality',
     });
 
-    const response = {
-      title: info.title,
-      thumbnail: info.thumbnail,
-      duration: info.duration,
-      duration_string: info.duration_string,
-      channel: info.channel || info.uploader,
-      view_count: info.view_count,
-      upload_date: info.upload_date,
-      description: info.description ? info.description.substring(0, 300) : '',
-      formats: formats,
-    };
-
-    res.json(response);
+    res.json({
+      title: data.title || 'Unknown',
+      thumbnail: data.thumbnailUrl || '',
+      duration: data.duration || 0,
+      duration_string: formatDuration(data.duration),
+      channel: data.uploader || 'Unknown',
+      view_count: data.views || 0,
+      upload_date: data.uploadDate || '',
+      description: data.description ? data.description.substring(0, 300) : '',
+      formats,
+    });
   } catch (error) {
-    console.error('Error fetching video info:', error.message);
-    console.error('Full error:', error.stderr || error);
-
-    // Provide specific error messages based on the error
-    let userMessage = 'Failed to fetch video information. Please check the URL and try again.';
-    const errText = (error.stderr || error.message || '').toLowerCase();
-
-    if (errText.includes('sign in') || errText.includes('bot') || errText.includes('403')) {
-      userMessage = 'YouTube is blocking requests from this server. The site owner needs to add a cookies.txt file.';
-    } else if (errText.includes('not found') || errText.includes('unavailable')) {
-      userMessage = 'This video is unavailable or does not exist.';
-    } else if (errText.includes('private')) {
-      userMessage = 'This video is private and cannot be downloaded.';
-    }
-
-    res.status(500).json({ error: userMessage });
+    console.error('Info error:', error.message);
+    res.status(500).json({
+      error: 'Failed to fetch video information. Please check the URL and try again.',
+    });
   }
 });
 
+// ═══════════════════════════════════════════════════════
+// DOWNLOAD ENDPOINTS
+// ═══════════════════════════════════════════════════════
+
 const jobs = new Map();
 
-// Start download job
 app.get('/api/download/start', async (req, res) => {
   const { url, format_id, title } = req.query;
-
   if (!url) return res.status(400).json({ error: 'URL is required' });
-  if (!isValidYouTubeUrl(url)) return res.status(400).json({ error: 'Invalid YouTube URL' });
+
+  const videoId = extractVideoId(url);
+  if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL' });
 
   const jobId = uuidv4();
   const sanitizedTitle = (title || 'video').replace(/[^a-zA-Z0-9\s\-_]/g, '').substring(0, 100);
   const isAudio = format_id === 'bestaudio';
-  
-  let ext = isAudio ? 'mp3' : 'mp4';
-  const tempOutputPath = path.join(tempDir, `${jobId}.${ext}`);
+  const ext = isAudio ? 'mp3' : 'mp4';
+  const outputPath = path.join(tempDir, `${jobId}.${ext}`);
 
-  jobs.set(jobId, { status: 'downloading', progress: '0%', filename: `${sanitizedTitle}.${ext}`, path: tempOutputPath });
+  jobs.set(jobId, {
+    status: 'downloading',
+    progress: '0%',
+    filename: `${sanitizedTitle}.${ext}`,
+    path: outputPath,
+  });
 
   res.json({ jobId });
 
-  const options = {
-    ...getBaseOptions(),
-    ffmpegLocation: ffmpeg,
-    output: tempOutputPath,
-    concurrentFragments: 8,
-    bufferSize: '16K',
-    httpChunkSize: '10M',
-    retries: 10,
-    fragmentRetries: 10,
-    noPart: true,
-  };
-
-  if (isAudio) {
-    options.format = 'bestaudio';
-    options.extractAudio = true;
-    options.audioFormat = 'mp3';
-  } else {
-    if (format_id && format_id !== 'best') {
-      options.format = `${format_id}+bestaudio[ext=m4a]/bestaudio/best`;
-    } else {
-      options.format = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best';
-    }
-    options.mergeOutputFormat = 'mp4';
-  }
-
-  try {
-    // Use the correct binary for exec too
-    const execFn = ytdlpPath
-      ? youtubedl.create(ytdlpPath)
-      : youtubedl;
-
-    const subprocess = execFn.exec(url, options);
-    
-    subprocess.stdout.on('data', (data) => {
-      const text = data.toString();
-      const match = text.match(/\[download\]\s+([\d\.]+)%/);
-      if (match) {
-        const job = jobs.get(jobId);
-        if (job) {
-          job.progress = match[1] + '%';
-        }
-      }
-    });
-
-    subprocess.on('close', (code) => {
-      const job = jobs.get(jobId);
-      if (job) {
-        if (code === 0) {
-          job.status = 'done';
-          job.progress = '100%';
-        } else {
-          job.status = 'error';
-          console.error(`Download job ${jobId} exited with code ${code}`);
-        }
-      }
-    });
-    
-    subprocess.on('error', (err) => {
-      const job = jobs.get(jobId);
-      if (job) job.status = 'error';
-      console.error(`Download job ${jobId} error:`, err.message);
-    });
-  } catch (error) {
+  // Process in background
+  processDownload(jobId, videoId, format_id, isAudio, outputPath).catch((err) => {
+    console.error(`Job ${jobId} failed:`, err.message);
     const job = jobs.get(jobId);
-    if (job) job.status = 'error';
-    console.error(`Download job ${jobId} catch error:`, error.message);
-  }
+    if (job && job.status !== 'done') job.status = 'error';
+  });
 });
 
-// Check job status
+async function processDownload(jobId, videoId, formatId, isAudio, outputPath) {
+  const job = jobs.get(jobId);
+
+  // Step 1: Get stream URLs from Piped
+  job.progress = '5%';
+  console.log(`📥 Job ${jobId}: fetching streams...`);
+  const data = await fetchFromPiped(videoId);
+
+  if (isAudio) {
+    // ── AUDIO-ONLY ──
+    const audioStream = getBestAudioStream(data.audioStreams);
+    if (!audioStream) throw new Error('No audio stream available');
+
+    job.progress = '10%';
+    console.log(`📥 Job ${jobId}: downloading audio (${audioStream.quality})...`);
+
+    const tempAudio = path.join(tempDir, `${jobId}_audio.${getExtFromMime(audioStream.mimeType)}`);
+    await downloadFile(audioStream.url, tempAudio);
+
+    job.progress = '70%';
+    console.log(`📥 Job ${jobId}: converting to mp3...`);
+    await convertToMp3(tempAudio, outputPath);
+
+    fs.unlink(tempAudio, () => {});
+  } else {
+    // ── VIDEO + AUDIO ──
+    const targetHeight = parseInt(formatId) || 0;
+    const videoStream = getBestVideoStream(data.videoStreams, targetHeight);
+    const audioStream = getBestAudioStream(data.audioStreams);
+
+    if (!videoStream) throw new Error('No video stream available');
+    if (!audioStream) throw new Error('No audio stream available');
+
+    // Download video
+    job.progress = '10%';
+    console.log(`📥 Job ${jobId}: downloading video (${videoStream.quality})...`);
+    const tempVideo = path.join(tempDir, `${jobId}_video.${getExtFromMime(videoStream.mimeType)}`);
+    await downloadFile(videoStream.url, tempVideo);
+
+    // Download audio
+    job.progress = '50%';
+    console.log(`📥 Job ${jobId}: downloading audio...`);
+    const tempAudio = path.join(tempDir, `${jobId}_audio.${getExtFromMime(audioStream.mimeType)}`);
+    await downloadFile(audioStream.url, tempAudio);
+
+    // Merge with ffmpeg
+    job.progress = '80%';
+    console.log(`📥 Job ${jobId}: merging...`);
+    await mergeMedia(tempVideo, tempAudio, outputPath);
+
+    fs.unlink(tempVideo, () => {});
+    fs.unlink(tempAudio, () => {});
+  }
+
+  job.status = 'done';
+  job.progress = '100%';
+  console.log(`✅ Job ${jobId}: complete!`);
+}
+
+// Status check
 app.get('/api/download/status', (req, res) => {
   const { id } = req.query;
   const job = jobs.get(id);
@@ -290,7 +422,7 @@ app.get('/api/download/status', (req, res) => {
   res.json({ status: job.status, progress: job.progress });
 });
 
-// Serve the file
+// Serve downloaded file
 app.get('/api/download/file', (req, res) => {
   const { id } = req.query;
   const job = jobs.get(id);
@@ -301,7 +433,6 @@ app.get('/api/download/file', (req, res) => {
 
   const fileStream = fs.createReadStream(job.path);
   fileStream.pipe(res);
-
   fileStream.on('close', () => {
     fs.unlink(job.path, () => {});
     jobs.delete(id);
@@ -314,6 +445,7 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🎬 YouTube Video Downloader is running!`);
-  console.log(`📡 Open http://localhost:${PORT} in your browser\n`);
+  console.log(`\n🎬 YTGrab is running!`);
+  console.log(`📡 http://localhost:${PORT}`);
+  console.log(`🔄 Using Piped API — no cookies needed\n`);
 });
