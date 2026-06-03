@@ -3,3 +3,4 @@ temp/*
 !temp/.gitkeep
 .DS_Store
 *.log
+yt-dlp

@@ -9,6 +9,20 @@ const ffmpeg = require('ffmpeg-static');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Determine the yt-dlp binary path
+// On Render (Linux), we install it via build.sh to ./yt-dlp
+// Locally, youtube-dl-exec bundles its own binary
+const localYtdlp = path.join(__dirname, 'yt-dlp');
+const ytdlpPath = fs.existsSync(localYtdlp) ? localYtdlp : undefined;
+
+// Create a configured yt-dlp instance
+const ytdlp = ytdlpPath
+  ? youtubedl.create(ytdlpPath)
+  : youtubedl;
+
+console.log(`🔧 yt-dlp binary: ${ytdlpPath || 'bundled default'}`);
+console.log(`🔧 ffmpeg binary: ${ffmpeg}`);
+
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -31,6 +45,20 @@ function isValidYouTubeUrl(url) {
   return patterns.some(pattern => pattern.test(url));
 }
 
+// Health check / debug endpoint
+app.get('/api/health', (req, res) => {
+  const localBinExists = fs.existsSync(localYtdlp);
+  res.json({
+    status: 'ok',
+    ytdlp_path: ytdlpPath || 'bundled',
+    ytdlp_local_exists: localBinExists,
+    ffmpeg_path: ffmpeg,
+    node_version: process.version,
+    platform: process.platform,
+    arch: process.arch,
+  });
+});
+
 // Get video info
 app.get('/api/info', async (req, res) => {
   const { url } = req.query;
@@ -44,7 +72,7 @@ app.get('/api/info', async (req, res) => {
   }
 
   try {
-    const info = await youtubedl(url, {
+    const info = await ytdlp(url, {
       dumpSingleJson: true,
       noCheckCertificates: true,
       noWarnings: true,
@@ -118,6 +146,7 @@ app.get('/api/info', async (req, res) => {
     res.json(response);
   } catch (error) {
     console.error('Error fetching video info:', error.message);
+    console.error('Full error:', error.stderr || error);
     res.status(500).json({
       error: 'Failed to fetch video information. Please check the URL and try again.',
     });
@@ -147,14 +176,14 @@ app.get('/api/download/start', async (req, res) => {
   const options = {
     noCheckCertificates: true,
     noWarnings: true,
-    ffmpegLocation: `"${ffmpeg}"`,
-    output: `"${tempOutputPath}"`,
-    concurrentFragments: 8,       // Download 8 fragments at the same time
-    bufferSize: '16K',            // Larger initial buffer
-    httpChunkSize: '10M',         // 10MB chunks for faster throughput
-    retries: 10,                  // Retry failed fragments
-    fragmentRetries: 10,          // Retry failed fragments
-    noPart: true,                 // Skip .part files for speed
+    ffmpegLocation: ffmpeg,
+    output: tempOutputPath,
+    concurrentFragments: 8,
+    bufferSize: '16K',
+    httpChunkSize: '10M',
+    retries: 10,
+    fragmentRetries: 10,
+    noPart: true,
   };
 
   if (isAudio) {
@@ -171,7 +200,12 @@ app.get('/api/download/start', async (req, res) => {
   }
 
   try {
-    const subprocess = youtubedl.exec(url, options);
+    // Use the correct binary for exec too
+    const execFn = ytdlpPath
+      ? youtubedl.create(ytdlpPath)
+      : youtubedl;
+
+    const subprocess = execFn.exec(url, options);
     
     subprocess.stdout.on('data', (data) => {
       const text = data.toString();
@@ -192,17 +226,20 @@ app.get('/api/download/start', async (req, res) => {
           job.progress = '100%';
         } else {
           job.status = 'error';
+          console.error(`Download job ${jobId} exited with code ${code}`);
         }
       }
     });
     
-    subprocess.on('error', () => {
+    subprocess.on('error', (err) => {
       const job = jobs.get(jobId);
       if (job) job.status = 'error';
+      console.error(`Download job ${jobId} error:`, err.message);
     });
   } catch (error) {
     const job = jobs.get(jobId);
     if (job) job.status = 'error';
+    console.error(`Download job ${jobId} catch error:`, error.message);
   }
 });
 
